@@ -17,7 +17,7 @@ from annotation.reading_order import suspicious_box_ids
 from annotation.workflow import Workflow
 from annotation.io import (final_document,
                            final_source_mismatch_document, load_image_list,
-                           read_json)
+                           read_json, atomic_write)
 from annotation.text_extraction import content_fields, normalize_content_titles
 from annotation.text_alignment import count_annotation_characters
 from annotation.export import (collect_annotations, collect_content_documents,
@@ -32,6 +32,97 @@ from ui.icons import WARNING
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
+RESUME_SCHEMA_VERSION = 1
+
+# Only persist application data that can safely be overlaid onto a freshly
+# opened image.  Paths and generated preview URLs are intentionally excluded:
+# they are recreated every time the app starts.
+RESUME_STATE_FIELDS = frozenset({
+    'source_content', 'verified_content', 'draft_content', 'annotation_text',
+    'saved_annotation_text', 'regions', 'selected_region_uid',
+    'selected_region_uids', 'selection_cleared', 'bounding_boxes',
+    'annotations', 'reading_order', 'text_sequence', 'text_token_ids',
+    'box_id_by_region', 'region_uid_by_box_id', 'selected_box_id',
+    'selected_token_id', 'detection_loaded', 'crop', 'resized_image_size',
+    'source_mismatch', 'crop_saved', 'current_step', 'workflow',
+})
+AUTOSAVE_ACTIONS = frozenset({
+    'add', 'update', 'delete', 'detect', 'next', 'back', 'undo', 'original',
+    'sort_boxes',
+    'confirm_source_mismatch', 'clear_source_mismatch', 'reorder_text',
+    'status', 'statuses', 'crop', 'field', 'save_content',
+})
+
+
+def resume_draft_path(output_dir, image_name):
+    """Return the private, non-exported checkpoint path for one image."""
+    return (Path(output_dir) / '.state' / 'drafts' /
+            (Path(image_name).stem + '.json'))
+
+
+def scan_resume_drafts(output_dir, images):
+    """Index checkpoints that belong to images offered by this app instance."""
+    root = Path(output_dir) / '.state' / 'drafts'
+    expected = {image.stem: image.name for image in images}
+    try:
+        candidates = root.glob('*.json') if root.is_dir() else ()
+        return {
+            candidate.stem: candidate
+            for candidate in candidates
+            if candidate.stem in expected
+        }
+    except OSError as exc:
+        log.warning('Cannot scan resume drafts in %s: %s', root, exc)
+        return {}
+
+
+def resume_snapshot(state):
+    """Build a JSON-only checkpoint without environment-specific values."""
+    return {
+        'version': RESUME_SCHEMA_VERSION,
+        'image': state['image'],
+        'image_size': state['image_size'],
+        'state': {
+            key: deepcopy(state[key])
+            for key in RESUME_STATE_FIELDS
+            if key in state
+        },
+    }
+
+
+def restore_resume_snapshot(fresh_state, path):
+    """Restore a checkpoint after checking that it belongs to this image."""
+    checkpoint = read_json(path)
+    if not isinstance(checkpoint, dict):
+        raise ValueError('Resume checkpoint must be a JSON object.')
+    if checkpoint.get('version') != RESUME_SCHEMA_VERSION:
+        raise ValueError('Resume checkpoint has an unsupported version.')
+    if checkpoint.get('image') != fresh_state['image']:
+        raise ValueError('Resume checkpoint belongs to a different image.')
+    if checkpoint.get('image_size') != fresh_state['image_size']:
+        raise ValueError('Resume checkpoint was made for different image dimensions.')
+    saved_state = checkpoint.get('state')
+    if not isinstance(saved_state, dict):
+        raise ValueError('Resume checkpoint does not contain application state.')
+    step = saved_state.get('current_step')
+    workflow = saved_state.get('workflow')
+    if (type(step) is not int or step not in range(2, 8)
+            or not isinstance(workflow, dict)
+            or set(workflow) != set(fresh_state['workflow'])
+            or any(type(value) is not bool for value in workflow.values())):
+        raise ValueError('Resume checkpoint has invalid workflow state.')
+    if not isinstance(saved_state.get('regions', {}), dict):
+        raise ValueError('Resume checkpoint has invalid bounding boxes.')
+
+    restored = deepcopy(fresh_state)
+    for key in RESUME_STATE_FIELDS:
+        if key in saved_state:
+            restored[key] = deepcopy(saved_state[key])
+    restored['current_step'] = step
+    # Revision belongs to the browser session.  A fresh value prevents a
+    # pending event from an earlier session from being accepted after resume.
+    restored['revision'] = fresh_state['revision']
+    return restored
 
 
 def loading_markup(label='Loading…', visible=False):
@@ -308,6 +399,10 @@ def create_app(options):
         if not images: startup='The image folder is empty.'
     except (ValueError,OSError) as exc:
         images=[]; startup=str(exc)
+    # Checkpoints are indexed once at startup.  The file itself is still read
+    # only when its image is opened, so a damaged checkpoint cannot stop the
+    # application from launching.
+    resume_drafts=scan_resume_drafts(options.output_dir, images)
 
     def has_saved_image_records():
         output=Path(options.output_dir)
@@ -316,6 +411,41 @@ def create_app(options):
             or (output/'source_mismatches'/(image.stem+'.json')).is_file()
             for image in images
         )
+
+    def checkpoint_is_newer_than_final(checkpoint, image_name):
+        """Allow an in-progress edit of an annotation that was saved before."""
+        stem=Path(image_name).stem
+        output=Path(options.output_dir)
+        final_paths=[
+            output/(stem+'.json'),
+            output/'source_mismatches'/(stem+'.json'),
+        ]
+        try:
+            final_mtimes=[path.stat().st_mtime_ns for path in final_paths if path.is_file()]
+            return not final_mtimes or checkpoint.stat().st_mtime_ns > max(final_mtimes)
+        except OSError as exc:
+            log.warning('Cannot compare checkpoint %s with final output: %s',checkpoint,exc)
+            return False
+
+    def autosave_state(state):
+        """Atomically save a resumable checkpoint without exporting it."""
+        if not state.get('image') or state.get('current_step', 1) < 2:
+            return
+        path=resume_draft_path(options.output_dir,state['image'])
+        atomic_write(path,resume_snapshot(state))
+        resume_drafts[Path(state['image']).stem]=path
+        log.info('Autosaved resume checkpoint %s at step %s',path,state['current_step'])
+
+    def discard_resume_state(image_name):
+        """A final Review save supersedes the private checkpoint."""
+        if not image_name:
+            return
+        path=resume_draft_path(options.output_dir,image_name)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning('Final annotation is saved but checkpoint %s could not be removed: %s',path,exc)
+        resume_drafts.pop(Path(image_name).stem,None)
 
     initial=dict(active=new_state(), drafts={})
     with gr.Blocks(title='Sino-Nôm Annotation Tool', fill_width=True, analytics_enabled=False) as app:
@@ -609,6 +739,7 @@ def create_app(options):
                 elif action == 'save_content':gr.Info('Updated for this session.')
                 if action == 'save':
                     saved_path=updated.get('image_path')
+                    discard_resume_state(updated.get('image'))
                     if saved_path:
                         ctx['drafts'].pop(saved_path,None)
                     fresh=new_state()
@@ -620,6 +751,8 @@ def create_app(options):
                     except Exception as exc:
                         log.exception('Detection failed')
                         msg='Detection failed: '+str(exc)
+                if action in AUTOSAVE_ACTIONS:
+                    autosave_state(ctx['active'])
                 result = render(ctx,msg)
                 # Preserve unaffected editors and avoid replacing unrelated component values.
                 suspicious_outputs={outputs.index(suspicious_toggle)}
@@ -657,9 +790,27 @@ def create_app(options):
                 # progressed into the annotation workflow, but do not overwrite
                 # a valid cached draft with the transient picker state.
                 if old.get('image_path') and old.get('current_step',1)>1:
+                    autosave_state(old)
                     ctx['drafts'][old['image_path']]=deepcopy(old)
                 # Unsaved edits are kept per image in this Gradio session.
-                state=deepcopy(ctx['drafts'][path]) if path in ctx['drafts'] else engine.open_image(path)
+                resume_message=''
+                if path in ctx['drafts']:
+                    state=deepcopy(ctx['drafts'][path])
+                else:
+                    state=engine.open_image(path)
+                    checkpoint=resume_drafts.get(Path(state['image']).stem)
+                    # A final Review output wins over an older leftover draft,
+                    # but a newer checkpoint represents an edit in progress.
+                    if checkpoint and checkpoint_is_newer_than_final(
+                            checkpoint,state['image']):
+                        try:
+                            state=restore_resume_snapshot(state,checkpoint)
+                            log.info('Resumed checkpoint %s for %s',checkpoint,state['image'])
+                        except (OSError,ValueError,TypeError,json.JSONDecodeError) as exc:
+                            log.warning('Cannot resume checkpoint %s: %s',checkpoint,exc)
+                            resume_message=(
+                                'Could not resume the unfinished checkpoint; '
+                                'opened a new annotation instead.')
                 state['revision']=old['revision']+1
                 ctx['active']=state
                 log.info('open success requested_path=%s resolved_image_path=%s image=%s step=%s revision=%s detection_loaded=%s content_verified=%s cache_hit=%s',
@@ -667,7 +818,7 @@ def create_app(options):
                          state.get('current_step'),state.get('revision'),
                          state.get('detection_loaded'),
                          state.get('workflow',{}).get('content_verified'),cached)
-                return render(ctx)
+                return render(ctx,resume_message)
             except Exception as exc:
                 log.exception('Cannot open image requested_path=%s active_path=%s active_step=%s',
                               path,active.get('image_path'),active.get('current_step'))
@@ -855,6 +1006,13 @@ def create_app(options):
                         ctx = dict(ctx, active=updated)
                 except Exception as exc:
                     return render(ctx, WARNING+' '+html.escape(str(exc)))
+            # Commit the current view before moving on.  This also preserves
+            # edits when validation prevents Next from changing screens.
+            try:
+                autosave_state(ctx['active'])
+            except (OSError,TypeError,ValueError) as exc:
+                return render(ctx, WARNING+' '+html.escape(
+                    'Could not autosave this annotation: '+str(exc)))
             result = run(ctx, 'next', auto_detect=auto_detect)
             if result[0]['active']['current_step'] == 2:
                 # Keep the current section and unsaved input visible on failure.
@@ -893,7 +1051,17 @@ def create_app(options):
                 try { return JSON.parse(draft || '{}')?.[path]?.value ?? ''; }
                 catch (_) { return ''; }
             }""",show_progress='hidden')
-        apply_field.click(
+        def autosave_content_draft(ctx,draft):
+            """Persist an accepted Content-editor change without advancing."""
+            try:
+                updated=commit_frontend_content(ctx,draft)
+                autosave_state(updated['active'])
+                return updated
+            except (OSError,TypeError,ValueError) as exc:
+                log.exception('Could not autosave content draft')
+                raise gr.Error('Could not autosave this text change: '+str(exc)) from exc
+
+        content_change=apply_field.click(
             fn=None,inputs=[field,field_value,content_bridge],
             outputs=[content_bridge,content_preview],queue=False,
             js="""(path, value, draft) => {
@@ -904,6 +1072,10 @@ def create_app(options):
                     field => ({tieu_de:field.title, van_ban:field.value}));
                 return [JSON.stringify(fields), JSON.stringify(preview,null,2)];
             }""",show_progress='hidden')
+        content_change.then(
+            autosave_content_draft,[session,content_bridge],[session],
+            concurrency_id='annotation-actions',concurrency_limit=1,
+            show_progress='hidden')
         def frontend_selection(value):
             try:
                 parsed=json.loads(value or '{}')
@@ -1078,6 +1250,7 @@ def create_app(options):
                 from annotation.status import require_damage_levels
                 candidate = commit_status_order(ctx, selection, status_value)
                 require_damage_levels(candidate['active'])
+                autosave_state(candidate['active'])
                 return render(candidate)
             except Exception as exc:
                 result = render(ctx, WARNING+' '+html.escape(str(exc)))
@@ -1221,7 +1394,44 @@ def create_app(options):
                                   ctx['active'].get('image_path'),request_id,
                                   payload.get('selectedIds'))
                     return sort_response(message=WARNING+' '+html.escape(str(exc)))
-            return run(ctx,evt._data['action'],evt._data['payload'])
+            action=evt._data['action']
+            payload=evt._data['payload']
+            if action == 'reorder_text':
+                try:
+                    # A card drag sends the complete local snapshot.  Commit
+                    # its status flags too, so the refresh after autosave does
+                    # not discard edits made immediately before the reorder.
+                    if not isinstance(payload,dict):
+                        raise ValueError('Text reorder requires the current editor snapshot.')
+                    payload=dict(payload)
+                    if 'textSequence' not in payload and 'sequence' in payload:
+                        payload['textSequence']=payload['sequence']
+                    if 'tokenOrder' not in payload and 'token_order' in payload:
+                        payload['tokenOrder']=payload['token_order']
+                    ctx=commit_status_order(ctx,json.dumps(payload))
+                    autosave_state(ctx['active'])
+                    return render(ctx)
+                except Exception as exc:
+                    return render(ctx,WARNING+' '+html.escape(str(exc)))
+            if action == 'delete':
+                try:
+                    # The editor sends its pre-delete snapshot so a pending
+                    # drag/resize is retained before the selected regions are
+                    # removed.  Do not forward its old revision after this
+                    # local commit increments it.
+                    boxes=payload.get('boxes') if isinstance(payload,dict) else None
+                    if not isinstance(boxes,dict):
+                        raise ValueError('Delete requires the current bounding-box snapshot.')
+                    selection=json.dumps({
+                        'boxes':boxes,
+                        'active':payload.get('active'),
+                        'selected':payload.get('selected',payload.get('ids',[])),
+                    })
+                    ctx,_,_=commit_frontend_boxes(ctx,selection)
+                    payload={'ids':payload.get('ids',[])}
+                except Exception as exc:
+                    return render(ctx,WARNING+' '+html.escape(str(exc)))
+            return run(ctx,action,payload)
         board.action(on_action,[session],outputs=outputs,concurrency_id='annotation-actions',
                      concurrency_limit=1,show_progress='hidden')
         app.load(fn=None, inputs=None, outputs=None, js=FONT_PRELOAD_JS,

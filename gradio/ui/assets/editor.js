@@ -1144,6 +1144,12 @@ const cleanupOrderDrag = (reason, commit = false) => {
       localTextSequence = textSequenceFromDOM(state.container);
       localTokenOrder = tokenOrderFromDOM(state.container);
       renderSelection();
+      if (state.dragged && props.value.step === 4) {
+        const board = element.querySelector('.workbench-board');
+        let snapshot = {};
+        try { snapshot = JSON.parse(board?.dataset?.localBoxesSnapshot || '{}'); } catch (_) {}
+        send('reorder_text', snapshot);
+      }
     }
   }
   if (state.captureTarget?.hasPointerCapture?.(state.pointerId)) {
@@ -1573,8 +1579,15 @@ root.addEventListener('click', event => {
     event.stopPropagation();
     if (!selectedIds.size) return;
     const beforeIds = Object.keys(localBoxes);
-    const deletedCount = selectedIds.size;
-    selectedIds.forEach(id => {
+    const deletedIds = [...selectedIds];
+    const deletePayload = {
+      ids: deletedIds,
+      boxes: serializeLocalBoxes(),
+      active: activeBoxId,
+      selected: deletedIds
+    };
+    const deletedCount = deletedIds.length;
+    deletedIds.forEach(id => {
       delete localBoxes[id];
       groupFor(id)?.remove();
     });
@@ -1586,6 +1599,7 @@ root.addEventListener('click', event => {
     isDirty = true;
     renderSelection();
     traceTransition(`DELETE ${deletedCount}`, beforeIds);
+    send('delete', deletePayload);
     return;
   }
   const manualOrderContainer = event.target.closest('#manual-box-order');
@@ -1742,8 +1756,15 @@ window.addEventListener('keydown', event => {
     }
     if (!selectedIds.size) return;
     const beforeIds = Object.keys(localBoxes);
-    const deletedCount = selectedIds.size;
-    selectedIds.forEach(id => {
+    const deletedIds = [...selectedIds];
+    const deletePayload = {
+      ids: deletedIds,
+      boxes: serializeLocalBoxes(),
+      active: activeBoxId,
+      selected: deletedIds
+    };
+    const deletedCount = deletedIds.length;
+    deletedIds.forEach(id => {
       delete localBoxes[id];
       groupFor(id)?.remove();
     });
@@ -1755,6 +1776,7 @@ window.addEventListener('keydown', event => {
     isDirty = true;
     renderSelection();
     traceTransition(`DELETE ${deletedCount}`, beforeIds);
+    send('delete', deletePayload);
     event.preventDefault();
   }
 });
